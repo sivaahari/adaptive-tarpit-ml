@@ -1,0 +1,28 @@
+Adaptive ML Tarpit — Model Evaluation Report
+Dataset  : NSL-KDD (KDDTrain+.txt / KDDTest+.txt)
+Features : ['duration', 'src_bytes', 'count', 'byte_rate', 'is_empty_flag']
+Train samples : 125,973
+Test  samples : 22,544
+
+──────────────────────────────────────────────────────────────────
+              precision    recall  f1-score   support
+
+      Benign       0.66      0.97      0.79      9711
+   Malicious       0.97      0.63      0.76     12833
+
+    accuracy                           0.77     22544
+   macro avg       0.81      0.80      0.77     22544
+weighted avg       0.83      0.77      0.77     22544
+
+Confusion Matrix (rows=actual, cols=predicted):
+  TN=  9427  FP=   284
+  FN=  4812  TP=  8021
+
+ROC-AUC : 0.9580
+
+Feature Importances (higher = more discriminating):
+  src_bytes          ██████████████████████████████ (4104)
+  count              █████████████ (1784)
+  byte_rate          ███████████ (1610)
+  duration           ██████████ (1432)
+  is_empty_flag       (70)

@@ -1,15 +1,32 @@
 """
 Train the LightGBM classifier using the NSL-KDD dataset.
 
-Features (6) — must match FEATURE_NAMES exactly and in this order:
-    [duration, src_bytes, dst_bytes, count, byte_rate, is_empty_flag]
+Features (5) — must match FEATURE_NAMES exactly and in this order.
+These are the ONLY features measurable from a live asyncio TCP stream:
+
+    [duration, src_bytes, count, byte_rate, is_empty_flag]
+
+Why 5, not 6?
+    dst_bytes was removed. In NSL-KDD it carries real signal, but at runtime
+    it is always 0.0 (no server response has been sent before classification).
+    Training on a feature that is structurally 0 at inference time biases the
+    model and degrades confidence scores. Removing it gives an honest model.
+
+    count is now populated at runtime via ConnectionRateTracker (see
+    network/feature_extractor.py and tarpit/tarpit_engine.py).
 
 Labels:
     'normal' → 0  (Benign)
-    anything else → 1  (Malicious / Probe / DoS / R2L / U2R)
+    anything else → 1  (Malicious: DoS / Probe / R2L / U2R)
 
 Usage:
     python3 models/train_model.py
+
+Outputs:
+    models/saved_models/lgbm_model.pkl
+    models/saved_models/scaler.pkl
+    models/saved_models/feature_names.pkl
+    models/evaluation_report.txt        ← committed artifact, not git-ignored
 """
 
 import os
@@ -41,15 +58,14 @@ NSLKDD_COLUMNS = [
     "dst_host_srv_rerr_rate", "label", "difficulty",
 ]
 
-# ── The 6 features our tarpit engine can extract at connection time ───────────
-# This list is saved alongside the model so classifier.py can validate input.
+# ── The 5 features measurable at runtime from a live TCP connection ───────────
+# Saved alongside the model so classifier.py can validate input length.
 FEATURE_NAMES = [
-    "duration",       # seconds from first byte to classification
-    "src_bytes",      # bytes received from the client
-    "dst_bytes",      # bytes sent to the client (0 pre-response; used in NSL-KDD)
-    "count",          # connections to the same host in past 2 s (NSL-KDD feature)
-    "byte_rate",      # (src_bytes + dst_bytes) / (duration + ε)
-    "is_empty_flag",  # 1.0 if src_bytes == 0 (stealth-probe indicator)
+    "duration",       # seconds from connection open to classification decision
+    "src_bytes",      # bytes received from the client in the observation window
+    "count",          # connections from this IP in the past 2 s (ConnectionRateTracker)
+    "byte_rate",      # src_bytes / (duration + ε) — connection speed signal
+    "is_empty_flag",  # 1.0 if src_bytes == 0 (null / stealth probe indicator)
 ]
 
 
@@ -64,13 +80,12 @@ def load_nslkdd(filepath: str) -> pd.DataFrame:
 
 def engineer_features(df: pd.DataFrame):
     """
-    Select and engineer the 6 runtime-measurable features from the NSL-KDD
-    DataFrame.  Returns (X: DataFrame, y: Series).
+    Select and engineer the 5 runtime-measurable features.
+    dst_bytes is intentionally excluded — see module docstring.
+    Returns (X: DataFrame, y: Series).
     """
     df = df.copy()
-    df["byte_rate"] = (
-        (df["src_bytes"] + df["dst_bytes"]) / (df["duration"] + 1e-6)
-    )
+    df["byte_rate"]    = df["src_bytes"] / (df["duration"] + 1e-6)
     df["is_empty_flag"] = (df["src_bytes"] == 0).astype(float)
     X = df[FEATURE_NAMES].astype(float)
     y = df["label_binary"]
@@ -80,9 +95,9 @@ def engineer_features(df: pd.DataFrame):
 # ── Training ──────────────────────────────────────────────────────────────────
 
 def train() -> None:
-    base_dir  = os.path.dirname(os.path.abspath(__file__))
-    data_dir  = os.path.join(base_dir, "..", "data", "raw")
-    save_dir  = os.path.join(base_dir, "saved_models")
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    data_dir = os.path.join(base_dir, "..", "data", "raw")
+    save_dir = os.path.join(base_dir, "saved_models")
     os.makedirs(save_dir, exist_ok=True)
 
     train_path = os.path.join(data_dir, "KDDTrain+.txt")
@@ -107,11 +122,16 @@ def train() -> None:
     print(f"  Test  : {len(X_test):,}  samples")
     vc = y_train.value_counts()
     print(f"  Train class balance → Benign: {vc.get(0,0):,}  Malicious: {vc.get(1,0):,}")
+    print(f"  Features ({len(FEATURE_NAMES)}): {FEATURE_NAMES}")
 
     # ── Scale ─────────────────────────────────────────────────────────────────
-    scaler          = StandardScaler()
-    X_train_scaled  = scaler.fit_transform(X_train)
-    X_test_scaled   = scaler.transform(X_test)
+    scaler         = StandardScaler()
+    X_train_scaled = pd.DataFrame(
+        scaler.fit_transform(X_train), columns=FEATURE_NAMES
+    )
+    X_test_scaled  = pd.DataFrame(
+        scaler.transform(X_test), columns=FEATURE_NAMES
+    )
 
     # ── Fit ───────────────────────────────────────────────────────────────────
     print("\nTraining LightGBM …")
@@ -130,20 +150,52 @@ def train() -> None:
     y_pred = model.predict(X_test_scaled)
     y_prob = model.predict_proba(X_test_scaled)[:, 1]
 
-    print("\n─── Evaluation on NSL-KDD Test Set ───────────────────────────────")
-    print(classification_report(y_test, y_pred, target_names=["Benign", "Malicious"]))
+    report  = classification_report(y_test, y_pred, target_names=["Benign", "Malicious"])
+    cm      = confusion_matrix(y_test, y_pred)
+    roc_auc = roc_auc_score(y_test, y_prob)
+
+    # ── Feature importance ────────────────────────────────────────────────────
+    importances = model.feature_importances_
+    fi_lines = "\nFeature Importances (higher = more discriminating):\n"
+    for name, score in sorted(zip(FEATURE_NAMES, importances), key=lambda x: -x[1]):
+        bar = "█" * int(score / max(importances) * 30)
+        fi_lines += f"  {name:<18} {bar} ({score})\n"
+
+    # ── Print to terminal ─────────────────────────────────────────────────────
+    separator = "─" * 66
+    print(f"\n{separator}")
+    print("Evaluation on NSL-KDD Test Set")
+    print(separator)
+    print(report)
     print("Confusion Matrix (rows=actual, cols=predicted):")
-    cm = confusion_matrix(y_test, y_pred)
     print(f"  TN={cm[0,0]:>6}  FP={cm[0,1]:>6}")
     print(f"  FN={cm[1,0]:>6}  TP={cm[1,1]:>6}")
-    print(f"\nROC-AUC : {roc_auc_score(y_test, y_prob):.4f}")
-    print("──────────────────────────────────────────────────────────────────\n")
+    print(f"\nROC-AUC : {roc_auc:.4f}")
+    print(fi_lines)
+    print(separator)
 
-    # ── Save ──────────────────────────────────────────────────────────────────
-    joblib.dump(model,        os.path.join(save_dir, "lgbm_model.pkl"))
-    joblib.dump(scaler,       os.path.join(save_dir, "scaler.pkl"))
+    # ── Save evaluation report as a committed artifact ────────────────────────
+    report_path = os.path.join(base_dir, "evaluation_report.txt")
+    with open(report_path, "w") as f:
+        f.write("Adaptive ML Tarpit — Model Evaluation Report\n")
+        f.write(f"Dataset  : NSL-KDD (KDDTrain+.txt / KDDTest+.txt)\n")
+        f.write(f"Features : {FEATURE_NAMES}\n")
+        f.write(f"Train samples : {len(X_train):,}\n")
+        f.write(f"Test  samples : {len(X_test):,}\n\n")
+        f.write(f"{separator}\n")
+        f.write(report)
+        f.write(f"\nConfusion Matrix (rows=actual, cols=predicted):\n")
+        f.write(f"  TN={cm[0,0]:>6}  FP={cm[0,1]:>6}\n")
+        f.write(f"  FN={cm[1,0]:>6}  TP={cm[1,1]:>6}\n")
+        f.write(f"\nROC-AUC : {roc_auc:.4f}\n")
+        f.write(fi_lines)
+    print(f"Evaluation report saved → {report_path}")
+
+    # ── Save model artifacts ──────────────────────────────────────────────────
+    joblib.dump(model,         os.path.join(save_dir, "lgbm_model.pkl"))
+    joblib.dump(scaler,        os.path.join(save_dir, "scaler.pkl"))
     joblib.dump(FEATURE_NAMES, os.path.join(save_dir, "feature_names.pkl"))
-    print(f"Saved model, scaler, and feature names → {save_dir}")
+    print(f"Model artifacts saved  → {save_dir}")
 
 
 if __name__ == "__main__":
