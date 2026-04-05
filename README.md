@@ -2,7 +2,6 @@
 
 > **A network defense system that uses machine learning to classify incoming TCP connections in real time — serving legitimate traffic instantly while trapping malicious probes and scanners in a high-latency drip loop that exhausts their resources.**
 
-[![Tests](https://github.com/sivaahari/adaptive-tarpit-ml/actions/workflows/tests.yml/badge.svg)](https://github.com/sivaahari/adaptive-tarpit-ml/actions/workflows/tests.yml)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)](https://www.python.org/)
 [![LightGBM](https://img.shields.io/badge/ML-LightGBM-ff69b4)](https://lightgbm.readthedocs.io/)
 [![Dataset](https://img.shields.io/badge/Dataset-NSL--KDD-orange)](https://www.unb.ca/cic/datasets/nsl.html)
