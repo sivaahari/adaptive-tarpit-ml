@@ -80,27 +80,19 @@ It serves as both a practical honeypot component and a showcase of applying mach
 
 ## How It Works
 
-  
-
 ```mermaid
-
 flowchart TD
+    A[Incoming TCP Connection] --> B[asyncio Server]
+    B --> C[Read first payload\n1-second timeout]
+    C --> D[Build feature vector]
+    D --> E[LightGBM Classifier]
+    E -->|Benign| F[Fast Path<br>Immediate HTTP 200 OK]
+    E -->|Malicious| G[Tarpit Mode<br>Slow drip loop]
+    F --> H[Log to SQLite]
+    G --> H
 
-A[Incoming TCP Connection] --> B[asyncio Server]
-
-B --> C[Read initial payload (1s timeout)]
-
-C --> D[Extract features: duration, src_bytes, count, byte_rate, is_empty_flag]
-
-D --> E[LightGBM Classification]
-
-E -->|Benign| F[Immediate HTTP 200 OK]
-
-E -->|Malicious| G[Slow Drip Loop<br>(null byte every 10s)]
-
-F --> H[Log to SQLite]
-
-G --> H
+    style F fill:#90EE90,stroke:#2E8B57
+    style G fill:#FFB6C1,stroke:#DC143C
 
 ```
 
